@@ -37,6 +37,41 @@ uint64 count                                  # 非首数据块数量 = 数据�
 
 其中 `sha256` 是全部数据块解压字节流拼接后的 SHA-256。
 
+### `POST /api/bgzf/extract`
+
+按 BGZF 虚拟偏移从归档中取出精确片段，避免下载整份归档。归档与索引先经
+过与审计接口完全相同的校验，任何审计失败都按原错误语义返回，无效端点无
+法绕过校验取到未审计数据。
+
+`multipart/form-data`：
+
+| 字段 | 内容 |
+| --- | --- |
+| `archive` | BGZF 压缩归档，不超过 **8 MiB**，最多 **4096** 个数据块 |
+| `index` | 配套块索引 |
+| `virtualStart` | 十进制无符号 64 位虚拟偏移（区间起点，含） |
+| `virtualEnd` | 十进制无符号 64 位虚拟偏移（区间终点，不含） |
+
+虚拟偏移布局：**高 48 位为成员压缩起点，低 16 位为块内解压位置**。端点
+必须规范且落在已审计数据块上：
+
+- 高 48 位必须是某个数据块的压缩起点（不得落在成员中间或归档之外）；
+- 低 16 位必须严格小于该块解压长度（等于块长的位置应写成下一块起点）；
+- 终点还可为 EOF 成员起点（块内偏移为 0），表示数据末尾；起点不可以。
+
+区间左闭右开、允许为空（起点等于终点时返回 0 字节）。跨块片段按归档顺
+序拼接，结果最大 **1 MiB**。
+
+成功响应 `200`，正文为 `application/octet-stream` 原始字节，并带响应头：
+
+| 响应头 | 内容 |
+| --- | --- |
+| `Content-Length` | 片段精确长度 |
+| `X-Bgzf-Virtual-Start` / `X-Bgzf-Virtual-End` | 规范端点（十进制） |
+| `X-Bgzf-Sha256` | 片段内容的 SHA-256（十六进制） |
+
+端点非法、逆序或结果超限时返回 `422` 与稳定错误码，绝不返回部分字节。
+
 ### 校验规则
 
 - 每个成员必须有合法 gzip 头（magic `1f 8b`、CM=deflate）且**恰好一个**
@@ -86,6 +121,11 @@ uint64 count                                  # 非首数据块数量 = 数据�
 | `TOO_MANY_BLOCKS` | 数据块超过 4096 |
 | `INDEX_TRUNCATED` / `INDEX_COUNT_MISMATCH` / `INDEX_SIZE_MISMATCH` | 索引结构错误 |
 | `INDEX_COMPRESSED_OFFSET_MISMATCH` / `INDEX_UNCOMPRESSED_OFFSET_MISMATCH` | 索引偏移漂移（重建索引） |
+| `BAD_VIRTUAL_OFFSET` | 虚拟偏移不是十进制无符号 64 位整数 |
+| `VIRTUAL_OFFSET_NOT_BLOCK_START` | 虚拟偏移高 48 位不是任何成员的压缩起点 |
+| `VIRTUAL_OFFSET_NOT_CANONICAL` | 端点不规范（块内偏移越界、EOF 被用作起点等） |
+| `VIRTUAL_OFFSETS_REVERSED` | 提取起点在终点之后 |
+| `EXTRACT_TOO_LARGE` | 提取区间超过 1 MiB |
 | `ARCHIVE_TOO_LARGE` / `REQUEST_TOO_LARGE` | 超过大小限制（HTTP 413） |
 | `MALFORMED_MULTIPART` / `MISSING_PART` | 请求格式错误 |
 
@@ -109,8 +149,10 @@ verify 服务依次执行：
 1. 等待 `/healthz` 健康；
 2. 构建检查（`compileall`）；
 3. 单元与 HTTP 端到端测试（`unittest`）；
-4. 提交四个冒烟样例：合法归档、CRC32 损坏、声明块长漂移、索引错位；
-   后三者必须返回带稳定错误码与压缩偏移的 `422`。
+4. 提交审计冒烟样例：合法归档、CRC32 损坏、声明块长漂移、索引错位，
+   后三者必须返回带稳定错误码与压缩偏移的 `422`；
+5. 提交提取冒烟样例：单块、跨块（核对字节与响应头摘要）、非法端点、
+   超限提取（必须 `422` 且不返回部分字节）。
 
 全部通过以退出码 `0` 结束，否则退出码为 `1`。
 

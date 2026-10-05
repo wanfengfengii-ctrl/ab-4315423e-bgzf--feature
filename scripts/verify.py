@@ -7,7 +7,9 @@ It waits for the application health endpoint, then:
 2. runs the unittest suite (code + HTTP-level tests);
 3. submits four smoke samples to ``POST /api/bgzf/audit``:
    a valid archive, a CRC32-corrupted member, a declared block-size
-   drift, and an index offset mismatch.
+   drift, and an index offset mismatch;
+4. exercises ``POST /api/bgzf/extract`` with single-block, cross-block,
+   invalid-endpoint and over-limit samples.
 
 Exits 0 only when every stage passes; exits 1 with a readable report
 otherwise, so Compose marks the one-off service as failed.
@@ -15,6 +17,7 @@ otherwise, so Compose marks the one-off service as failed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import struct
@@ -23,11 +26,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from email.message import Message
 from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests.bgzf_fixtures import bgzf_block, build_archive, build_index, encode_multipart  # noqa: E402
+from tests.bgzf_fixtures import EOF_MEMBER, bgzf_block, build_archive, build_index, encode_multipart  # noqa: E402
 
 APP_URL = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
 
@@ -87,6 +91,30 @@ def post_audit(archive: bytes, index: bytes) -> tuple[int, dict]:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
+
+
+def post_extract(
+    archive: bytes, index: bytes, virtual_start: int, virtual_end: int
+) -> tuple[int, Message, bytes]:
+    body, content_type = encode_multipart(
+        {
+            "archive": ("sample.bgz", archive),
+            "index": ("sample.gzi", index),
+            "virtualStart": ("", str(virtual_start).encode()),
+            "virtualEnd": ("", str(virtual_end).encode()),
+        }
+    )
+    req = urllib.request.Request(
+        f"{APP_URL}/api/bgzf/extract",
+        data=body,
+        headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
 
 
 SMOKES: list[tuple[str, Callable[[], str]]] = []
@@ -156,6 +184,69 @@ def smoke_index_drift():
     assert body["error"]["code"] == "INDEX_COMPRESSED_OFFSET_MISMATCH"
     assert body["error"]["offset"] == len(bgzf_block(payloads[0]))
     return f"422 {body['error']['code']} at offset {body['error']['offset']}"
+
+
+@smoke("extract single block")
+def smoke_extract_single_block():
+    payloads = [b"alpha-block", b"beta-block!", b"gamma-block?"]
+    archive = build_archive(payloads)
+    index = build_index(archive, payloads)
+    block1_start = len(bgzf_block(payloads[0]))
+    vs = (block1_start << 16) | 2
+    ve = (block1_start << 16) | 7
+    status, headers, data = post_extract(archive, index, vs, ve)
+    assert status == 200, f"expected 200, got {status}: {data!r}"
+    assert data == payloads[1][2:7], f"unexpected fragment: {data!r}"
+    assert headers.get("Content-Type") == "application/octet-stream"
+    assert int(headers.get("Content-Length", "-1")) == len(data)
+    assert headers.get("X-Bgzf-Virtual-Start") == str(vs)
+    assert headers.get("X-Bgzf-Virtual-End") == str(ve)
+    assert headers.get("X-Bgzf-Sha256") == hashlib.sha256(data).hexdigest()
+    return f"200 {len(data)} bytes, sha256={headers['X-Bgzf-Sha256'][:12]}..."
+
+
+@smoke("extract across blocks")
+def smoke_extract_cross_block():
+    payloads = [b"alpha-block", b"beta-block!", b"gamma-block?"]
+    archive = build_archive(payloads)
+    index = build_index(archive, payloads)
+    block1_start = len(bgzf_block(payloads[0]))
+    block2_start = block1_start + len(bgzf_block(payloads[1]))
+    vs = (block1_start << 16) | 5
+    ve = (block2_start << 16) | 6
+    expected = payloads[1][5:] + payloads[2][:6]
+    status, headers, data = post_extract(archive, index, vs, ve)
+    assert status == 200, f"expected 200, got {status}: {data!r}"
+    assert data == expected, f"unexpected fragment: {data!r}"
+    assert headers.get("X-Bgzf-Sha256") == hashlib.sha256(expected).hexdigest()
+    return f"200 {len(data)} bytes concatenated across 2 blocks"
+
+
+@smoke("extract invalid endpoint")
+def smoke_extract_invalid_endpoint():
+    payloads = [b"alpha-block", b"beta-block!"]
+    archive = build_archive(payloads)
+    index = build_index(archive, payloads)
+    eof_start = len(archive) - len(EOF_MEMBER)
+    vs = 3 << 16  # inside block 0: not a member start
+    status, _headers, data = post_extract(archive, index, vs, eof_start << 16)
+    assert status == 422, f"expected 422, got {status}: {data!r}"
+    body = json.loads(data)
+    assert body["error"]["code"] == "VIRTUAL_OFFSET_NOT_BLOCK_START", body
+    return f"422 {body['error']['code']}"
+
+
+@smoke("extract over limit")
+def smoke_extract_over_limit():
+    payloads = [b"z" * 65536] * 17  # 17 * 64 KiB > 1 MiB extraction cap
+    archive = build_archive(payloads)
+    index = build_index(archive, payloads)
+    eof_start = len(archive) - len(EOF_MEMBER)
+    status, _headers, data = post_extract(archive, index, 0, eof_start << 16)
+    assert status == 422, f"expected 422, got {status}: {data!r}"
+    body = json.loads(data)
+    assert body["error"]["code"] == "EXTRACT_TOO_LARGE", body
+    return f"422 {body['error']['code']} (no partial bytes)"
 
 
 def run_smokes() -> bool:
