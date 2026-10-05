@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -12,8 +13,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.bgzf import MAX_EXTRACT_SIZE  # noqa: E402
 from app.server import create_server  # noqa: E402
 from tests.bgzf_fixtures import bgzf_block, build_archive, build_index, encode_multipart  # noqa: E402
+
+
+def vo(compressed_start: int, block_offset: int = 0) -> int:
+    return (compressed_start << 16) | block_offset
 
 
 class HttpServerTestBase(unittest.TestCase):
@@ -146,6 +152,179 @@ class AuditEndpointTests(HttpServerTestBase):
         self.assertEqual(set(payload["error"].keys()), {"code", "message", "offset"})
         self.assertEqual(payload["error"]["code"], "BAD_MAGIC")
         self.assertEqual(payload["error"]["offset"], 0)
+
+
+class ExtractEndpointTests(HttpServerTestBase):
+    def setUp(self):
+        super().setUp()
+        self.payloads = [b"block-zero", b"block-one!!", b"block-two"]
+        self.archive = build_archive(self.payloads)
+        self.index = build_index(self.archive, self.payloads)
+        sizes = [len(bgzf_block(p)) for p in self.payloads]
+        self.starts = [0, sizes[0], sizes[0] + sizes[1]]
+        self.eof_start = self.starts[2] + sizes[2]
+
+    def post_extract(self, virtual_start, virtual_end, archive=None, index=None):
+        fields = {
+            "archive": ("a.bgz", self.archive if archive is None else archive),
+            "index": ("a.gzi", self.index if index is None else index),
+            "virtualStart": ("start", str(virtual_start).encode()),
+            "virtualEnd": ("end", str(virtual_end).encode()),
+        }
+        body, ct = encode_multipart(fields)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/api/bgzf/extract",
+            body=body,
+            headers={"Content-Type": ct, "Content-Length": str(len(body))},
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        conn.close()
+        return resp.status, headers, data
+
+    def test_single_block_extract(self):
+        status, headers, data = self.post_extract(
+            vo(self.starts[0], 3), vo(self.starts[0], 8)
+        )
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data, b"ck-ze")
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(int(headers["content-length"]), len(data))
+        self.assertEqual(headers["x-virtual-start"], str(vo(self.starts[0], 3)))
+        self.assertEqual(headers["x-virtual-end"], str(vo(self.starts[0], 8)))
+        self.assertEqual(headers["x-content-sha256"], hashlib.sha256(data).hexdigest())
+
+    def test_cross_block_extract_is_concatenated_in_order(self):
+        status, headers, data = self.post_extract(
+            vo(self.starts[0], 6), vo(self.starts[2], 5)
+        )
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data, b"zero" + b"block-one!!" + b"block")
+        self.assertEqual(int(headers["content-length"]), len(data))
+        self.assertEqual(headers["x-content-sha256"], hashlib.sha256(data).hexdigest())
+
+    def test_extract_to_eof_start_and_empty_interval(self):
+        status, headers, data = self.post_extract(
+            vo(self.starts[2], 6), vo(self.eof_start)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data, b"two")
+        self.assertEqual(headers["x-virtual-end"], str(vo(self.eof_start)))
+
+        status, headers, data = self.post_extract(
+            vo(self.starts[1], 2), vo(self.starts[1], 2)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data, b"")
+        self.assertEqual(headers["content-length"], "0")
+
+    def test_illegal_endpoint_returns_422_and_no_bytes(self):
+        for bad_start, bad_end in (
+            (vo(self.starts[0], 99), vo(self.eof_start)),
+            (vo(5), vo(self.eof_start)),
+            (vo(self.eof_start), vo(self.eof_start)),
+            (vo(self.starts[0]), vo(self.starts[0], 10)),
+        ):
+            status, headers, data = self.post_extract(bad_start, bad_end)
+            self.assertEqual(status, 422, (bad_start, bad_end, data))
+            self.assertEqual(headers["content-type"], "application/json")
+            body = json.loads(data)
+            self.assertIn(body["error"]["code"],
+                          {"VIRTUAL_OFFSET_NOT_CANONICAL", "VIRTUAL_OFFSET_OUT_OF_RANGE"})
+            self.assertEqual(set(body["error"].keys()), {"code", "message", "offset"})
+
+    def test_reversed_interval_returns_422(self):
+        status, _headers, data = self.post_extract(
+            vo(self.starts[2], 1), vo(self.starts[1], 1)
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(json.loads(data)["error"]["code"], "VIRTUAL_OFFSET_REVERSED")
+
+    def test_malformed_offset_returns_422(self):
+        fields = {
+            "archive": ("a.bgz", self.archive),
+            "index": ("a.gzi", self.index),
+            "virtualStart": ("start", b"-1"),
+            "virtualEnd": ("end", b"0"),
+        }
+        body, ct = encode_multipart(fields)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/bgzf/extract", body=body, headers={"Content-Type": ct})
+        resp = conn.getresponse()
+        payload = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(resp.status, 422)
+        self.assertEqual(payload["error"]["code"], "BAD_VIRTUAL_OFFSET")
+
+        fields["virtualStart"] = ("start", str(2**64).encode())
+        body, ct = encode_multipart(fields)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/bgzf/extract", body=body, headers={"Content-Type": ct})
+        resp = conn.getresponse()
+        payload = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(resp.status, 422)
+        self.assertEqual(payload["error"]["code"], "BAD_VIRTUAL_OFFSET")
+
+    def test_over_limit_returns_422(self):
+        payloads = [b"\0" * 60000 for _ in range(20)]
+        archive = build_archive(payloads)
+        index = build_index(archive, payloads)
+        sizes = [len(bgzf_block(p)) for p in payloads]
+        starts = [0]
+        for size in sizes[:-1]:
+            starts.append(starts[-1] + size)
+        eof_start = starts[-1] + sizes[-1]
+        status, headers, data = self.post_extract(
+            vo(0), vo(eof_start), archive=archive, index=index
+        )
+        self.assertEqual(status, 422)
+        body = json.loads(data)
+        self.assertEqual(body["error"]["code"], "EXTRACT_TOO_LARGE")
+        self.assertEqual(headers["content-type"], "application/json")
+
+    def test_corrupt_archive_is_rejected_without_bytes(self):
+        block0_len = len(bgzf_block(self.payloads[0]))
+        broken = bytearray(self.archive)
+        struct.pack_into("<I", broken, block0_len - 8, 0xDEADBEEF)
+        status, _headers, data = self.post_extract(
+            vo(0), vo(self.eof_start), archive=bytes(broken)
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(json.loads(data)["error"]["code"], "CRC32_MISMATCH")
+
+    def test_missing_extract_parts(self):
+        fields = {
+            "archive": ("a.bgz", self.archive),
+            "index": ("a.gzi", self.index),
+            "virtualStart": ("start", b"0"),
+        }
+        body, ct = encode_multipart(fields)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/bgzf/extract", body=body, headers={"Content-Type": ct})
+        resp = conn.getresponse()
+        body_obj = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(resp.status, 422)
+        self.assertEqual(body_obj["error"]["code"], "MISSING_PART")
+
+    def test_exactly_limit_succeeds(self):
+        payloads = [b"\0" * 60000 for _ in range(20)]
+        archive = build_archive(payloads)
+        index = build_index(archive, payloads)
+        sizes = [len(bgzf_block(p)) for p in payloads]
+        starts = [0]
+        for size in sizes[:-1]:
+            starts.append(starts[-1] + size)
+        end_inner = MAX_EXTRACT_SIZE - 17 * 60000
+        status, headers, data = self.post_extract(
+            vo(0), vo(starts[17], end_inner), archive=archive, index=index
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data), MAX_EXTRACT_SIZE)
 
 
 if __name__ == "__main__":

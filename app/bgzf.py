@@ -15,6 +15,11 @@ The companion index is a little-endian unsigned 64-bit structure::
 with one entry for every data block except the first, recording the
 block's compressed-file offset and the cumulative decompressed offset at
 which its payload begins.
+
+Audited archives are also random-accessible through BGZF *virtual
+offsets*: ``compressed_member_start << 16 | block_internal_offset``.
+:func:`extract` re-audits archive and index before slicing, so only
+fully audited bytes can ever leave the service.
 """
 
 from __future__ import annotations
@@ -27,6 +32,13 @@ from dataclasses import dataclass
 # Limits imposed by the platform.
 MAX_ARCHIVE_SIZE = 8 * 1024 * 1024  # 8 MiB compressed archive
 MAX_DATA_BLOCKS = 4096
+MAX_EXTRACT_SIZE = 1 * 1024 * 1024  # 1 MiB decompressed payload per extraction
+
+# BGZF virtual offsets pack the compressed member start into the high 48
+# bits and the block-internal uncompressed position into the low 16 bits.
+VIRTUAL_OFFSET_SHIFT = 16
+VIRTUAL_OFFSET_MASK = 0xFFFF
+UINT64_MAX = (1 << 64) - 1
 
 # Canonical BGZF EOF member: an empty block produced by every conformant
 # writer (htslib, bgzip, ...).
@@ -59,6 +71,39 @@ class AuditResult:
     data_blocks: int
     uncompressed_length: int
     sha256: str  # hex digest of the concatenated decompressed payload
+
+
+@dataclass(frozen=True)
+class Block:
+    """One audited data block: compressed extent and decompressed payload."""
+
+    start: int
+    end: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class AuditedArchive:
+    """A fully validated archive, ready for virtual-offset access."""
+
+    archive: bytes
+    blocks: tuple[Block, ...]  # data blocks only (the EOF member excluded)
+    eof_start: int
+    uncompressed_length: int
+
+    @property
+    def sha256(self) -> str:
+        digest = hashlib.sha256()
+        for block in self.blocks:
+            digest.update(block.payload)
+        return digest.hexdigest()
+
+    def audit_result(self) -> AuditResult:
+        return AuditResult(
+            data_blocks=len(self.blocks),
+            uncompressed_length=self.uncompressed_length,
+            sha256=self.sha256,
+        )
 
 
 def _fail(code: str, message: str, offset: int) -> "AuditError":
@@ -207,11 +252,12 @@ def _parse_bgzf_member(data: bytes, start: int) -> tuple[int, bytes, int]:
     return member_end, payload, isize_stored
 
 
-def audit(archive: bytes, index: bytes) -> AuditResult:
+def audit_archive(archive: bytes, index: bytes) -> AuditedArchive:
     """Validate a BGZF archive together with its companion block index.
 
     Raises :class:`AuditError` on the first problem, positioned at the
-    first locatable compressed offset.
+    first locatable compressed offset.  Returns the parsed blocks so
+    callers can serve audited byte ranges without reparsing.
     """
     if len(archive) > MAX_ARCHIVE_SIZE:
         raise AuditError(
@@ -265,18 +311,17 @@ def audit(archive: bytes, index: bytes) -> AuditResult:
 
     _audit_index(index, data_members)
 
-    # Everything is consistent: assemble the decompressed stream.
-    digest = hashlib.sha256()
-    total = 0
-    for _start, _end, payload in data_members:
-        digest.update(payload)
-        total += len(payload)
-
-    return AuditResult(
-        data_blocks=len(data_members),
-        uncompressed_length=total,
-        sha256=digest.hexdigest(),
+    return AuditedArchive(
+        archive=archive,
+        blocks=tuple(Block(start, end, payload) for start, end, payload in data_members),
+        eof_start=eof_start,
+        uncompressed_length=sum(len(payload) for _s, _e, payload in data_members),
     )
+
+
+def audit(archive: bytes, index: bytes) -> AuditResult:
+    """Validate a BGZF archive together with its companion block index."""
+    return audit_archive(archive, index).audit_result()
 
 
 def _audit_index(index: bytes, data_members: list[tuple[int, int, bytes]]) -> None:
@@ -334,3 +379,178 @@ def _audit_index(index: bytes, data_members: list[tuple[int, int, bytes]]) -> No
                 start,
             )
         cumulative += len(payload)
+
+
+def _make_virtual_offset(compressed_start: int, block_offset: int) -> int:
+    return (compressed_start << VIRTUAL_OFFSET_SHIFT) | block_offset
+
+
+def _split_virtual_offset(value: int) -> tuple[int, int]:
+    return value >> VIRTUAL_OFFSET_SHIFT, value & VIRTUAL_OFFSET_MASK
+
+
+def _resolve_virtual_offset(
+    audited: AuditedArchive, value: int, *, allow_eof: bool, side: str
+) -> tuple[int, int]:
+    """Map a canonical virtual offset to ``(block_index, block_offset)``.
+
+    ``block_index`` may equal ``len(blocks)`` only when ``allow_eof`` is
+    set and the offset is exactly the start of the canonical EOF member
+    with a zero in-block position.  Any non-canonical or unlocatable
+    offset raises :class:`AuditError`.
+    """
+    compressed_start, block_offset = _split_virtual_offset(value)
+
+    for i, block in enumerate(audited.blocks):
+        if block.start == compressed_start:
+            payload_len = len(block.payload)
+            if block_offset > payload_len:
+                raise AuditError(
+                    "VIRTUAL_OFFSET_OUT_OF_RANGE",
+                    (
+                        f"{side} virtual offset {value}: block-internal position "
+                        f"{block_offset} exceeds payload length {payload_len} of "
+                        f"block starting at {compressed_start}"
+                    ),
+                    compressed_start,
+                )
+            if payload_len and block_offset == payload_len:
+                # A block's end is canonically named by the next block's
+                # start (or by the EOF member start after the last block);
+                # encoding it as this block's inner end is ambiguous and
+                # therefore not canonical.
+                raise AuditError(
+                    "VIRTUAL_OFFSET_NOT_CANONICAL",
+                    (
+                        f"{side} virtual offset {value}: inner position "
+                        f"{block_offset} equals the payload length of the block "
+                        f"starting at {compressed_start}; name a block boundary "
+                        "through the next block's start (or the EOF member start)"
+                    ),
+                    compressed_start,
+                )
+            # inner == 0 on a zero-length data block is a legal reader
+            # offset that names the same decompressed position as the
+            # following block's start.
+            return i, block_offset
+
+    # The end point may sit on the start of the EOF member, which marks
+    # the end of the audited decompressed stream.
+    if allow_eof and compressed_start == audited.eof_start and block_offset == 0:
+        return len(audited.blocks), 0
+
+    if compressed_start == audited.eof_start:
+        # EOF member reached with a nonzero inner offset, or used as start.
+        if not allow_eof:
+            raise AuditError(
+                "VIRTUAL_OFFSET_NOT_CANONICAL",
+                (
+                    f"{side} virtual offset {value}: the start endpoint must "
+                    "lie within an audited data block, not on the EOF member"
+                ),
+                audited.eof_start,
+            )
+        raise AuditError(
+            "VIRTUAL_OFFSET_NOT_CANONICAL",
+            (
+                f"{side} virtual offset {value}: only offset "
+                f"{_make_virtual_offset(audited.eof_start, 0)} (the EOF member start) "
+                "may reference the EOF member"
+            ),
+            audited.eof_start,
+        )
+
+    raise AuditError(
+        "VIRTUAL_OFFSET_NOT_CANONICAL",
+        (
+            f"{side} virtual offset {value}: compressed start {compressed_start} "
+            "is not the start of an audited data block"
+        ),
+        compressed_start if compressed_start <= len(audited.archive) else None,
+    )
+
+
+def extract(
+    archive: bytes, index: bytes, virtual_start: int, virtual_end: int
+) -> tuple[bytes, int, int]:
+    """Return the audited payload slice ``[virtual_start, virtual_end)``.
+
+    The archive and index are fully re-audited before any byte is sliced,
+    so an invalid or unaudited endpoint can never return partial data.
+    Returns ``(data, canonical_start, canonical_end)``.  The interval is
+    half-open, follows archive order, may be empty and may contain at
+    most :data:`MAX_EXTRACT_SIZE` decompressed bytes.
+    """
+    if not isinstance(virtual_start, int) or isinstance(virtual_start, bool):
+        raise AuditError("BAD_VIRTUAL_OFFSET", "virtualStart must be an unsigned 64-bit integer", None)
+    if not isinstance(virtual_end, int) or isinstance(virtual_end, bool):
+        raise AuditError("BAD_VIRTUAL_OFFSET", "virtualEnd must be an unsigned 64-bit integer", None)
+    if not (0 <= virtual_start <= UINT64_MAX) or not (0 <= virtual_end <= UINT64_MAX):
+        raise AuditError("BAD_VIRTUAL_OFFSET", "virtual offsets must be unsigned 64-bit integers", None)
+
+    # Audit first: nothing is returned for an archive that fails the
+    # existing checks, and endpoints must be backed by audited blocks.
+    audited = audit_archive(archive, index)
+
+    start_block, start_off = _resolve_virtual_offset(
+        audited, virtual_start, allow_eof=False, side="start"
+    )
+    end_block, end_off = _resolve_virtual_offset(
+        audited, virtual_end, allow_eof=True, side="end"
+    )
+
+    # Translate both endpoints onto the linear decompressed stream.  The
+    # EOF endpoint (block index == len(blocks)) maps to the stream end.
+    uncomp_starts: list[int] = []
+    cumulative = 0
+    for block in audited.blocks:
+        uncomp_starts.append(cumulative)
+        cumulative += len(block.payload)
+
+    start_pos = uncomp_starts[start_block] + start_off
+    end_pos = (
+        audited.uncompressed_length
+        if end_block == len(audited.blocks)
+        else uncomp_starts[end_block] + end_off
+    )
+
+    if start_pos > end_pos:
+        raise AuditError(
+            "VIRTUAL_OFFSET_REVERSED",
+            (
+                f"start virtual offset {virtual_start} is after end virtual offset "
+                f"{virtual_end} in the decompressed stream"
+            ),
+            virtual_start >> VIRTUAL_OFFSET_SHIFT,
+        )
+    length = end_pos - start_pos
+    if length > MAX_EXTRACT_SIZE:
+        raise AuditError(
+            "EXTRACT_TOO_LARGE",
+            f"extraction spans {length} bytes, limit is {MAX_EXTRACT_SIZE}",
+            virtual_start >> VIRTUAL_OFFSET_SHIFT,
+        )
+
+    # Assemble the slice in archive order, touching only blocks the
+    # interval covers -- the whole archive is never served.  The block
+    # holding the exclusive end point is included; the lo/hi clamping
+    # below naturally yields an empty intersection for empty ranges.
+    pieces: list[bytes] = []
+    last_block = end_block if end_block < len(audited.blocks) else len(audited.blocks) - 1
+    for i in range(start_block, last_block + 1):
+        block = audited.blocks[i]
+        begin = uncomp_starts[i]
+        lo = max(start_pos, begin) - begin
+        hi = min(end_pos, begin + len(block.payload)) - begin
+        if hi > lo:
+            pieces.append(block.payload[lo:hi])
+    data = b"".join(pieces)
+
+    canonical_start = _make_virtual_offset(
+        audited.blocks[start_block].start, start_off
+    )
+    if end_block == len(audited.blocks):
+        canonical_end = _make_virtual_offset(audited.eof_start, 0)
+    else:
+        canonical_end = _make_virtual_offset(audited.blocks[end_block].start, end_off)
+    return data, canonical_start, canonical_end

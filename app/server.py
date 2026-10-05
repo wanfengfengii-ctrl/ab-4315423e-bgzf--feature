@@ -2,9 +2,13 @@
 
 Exposes:
 
-* ``POST /api/bgzf/audit`` -- multipart/form-data with ``archive`` and
+* ``POST /api/bgzf/audit``   -- multipart/form-data with ``archive`` and
   ``index`` file parts.
-* ``GET  /healthz``        -- liveness probe for the container health
+* ``POST /api/bgzf/extract`` -- multipart/form-data with ``archive``,
+  ``index`` and decimal unsigned-64 ``virtualStart`` / ``virtualEnd``
+  parts, returning the audited payload slice as
+  ``application/octet-stream``.
+* ``GET  /healthz``           -- liveness probe for the container health
   check.
 
 Only the Python standard library is required.
@@ -12,12 +16,16 @@ Only the Python standard library is required.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .bgzf import MAX_ARCHIVE_SIZE, AuditError, audit
+from .bgzf import MAX_ARCHIVE_SIZE, UINT64_MAX, AuditError, audit, extract
+
+AUDIT_PATH = "/api/bgzf/audit"
+EXTRACT_PATH = "/api/bgzf/extract"
 
 # The index for 4096 blocks is ~64 KiB; allow generous multipart framing
 # overhead on top of the 8 MiB archive limit.
@@ -114,13 +122,23 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self) -> None:  # noqa: N802 - http.server hook
-        if self.path.split("?", 1)[0] != "/api/bgzf/audit":
+        path = self.path.split("?", 1)[0]
+        if path == AUDIT_PATH:
+            self._handle_audit()
+        elif path == EXTRACT_PATH:
+            self._handle_extract()
+        else:
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": {"code": "NOT_FOUND", "message": "unknown path", "offset": None}},
             )
-            return
 
+    def _read_multipart_parts(self) -> dict[str, bytes] | None:
+        """Validate framing and size of a multipart request.
+
+        Writes the transport-level error response itself and returns
+        ``None`` on failure; otherwise returns the parsed parts.
+        """
         content_type = self.headers.get("Content-Type", "")
         if not content_type.lower().startswith("multipart/form-data"):
             self._write_json(
@@ -133,7 +151,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            return
+            return None
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -144,7 +162,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 HTTPStatus.LENGTH_REQUIRED,
                 {"error": {"code": "BAD_CONTENT_LENGTH", "message": "invalid Content-Length", "offset": None}},
             )
-            return
+            return None
         if length > MAX_REQUEST_SIZE:
             # Drain a modestly oversized body so the uploader still reads
             # the 413 cleanly; refuse to tie up a thread draining a body
@@ -161,7 +179,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            return
+            return None
 
         body = self._read_exactly(length)
         if body is None:
@@ -169,18 +187,19 @@ class AuditHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 {"error": {"code": "TRUNCATED_REQUEST", "message": "request body shorter than Content-Length", "offset": None}},
             )
-            return
+            return None
 
         try:
-            parts = parse_multipart(body, content_type)
+            return parse_multipart(body, content_type)
         except MultipartError as exc:
             self._write_json(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
                 {"error": {"code": "MALFORMED_MULTIPART", "message": str(exc), "offset": None}},
             )
-            return
+            return None
 
-        missing = [name for name in ("archive", "index") if name not in parts]
+    def _require_parts(self, parts: dict[str, bytes], names: tuple[str, ...]) -> bool:
+        missing = [name for name in names if name not in parts]
         if missing:
             self._write_json(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -192,28 +211,61 @@ class AuditHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
+            return False
+        return True
+
+    def _write_audit_error(self, exc: AuditError) -> None:
+        # Size is a transport-level rejection; everything else is a
+        # semantic 422 with a stable, locatable error code.
+        status = (
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            if exc.code == "ARCHIVE_TOO_LARGE"
+            else HTTPStatus.UNPROCESSABLE_ENTITY
+        )
+        self._write_json(
+            status,
+            {
+                "error": {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "offset": exc.offset,
+                }
+            },
+        )
+
+    @staticmethod
+    def _parse_uint64_field(parts: dict[str, bytes], name: str) -> int:
+        raw = parts[name].strip()
+        # Exact decimal grammar: ASCII digits only, no sign or interior
+        # whitespace; reject anything that does not fit in uint64.
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            text = ""
+        if not text or not text.isdigit():
+            raise AuditError(
+                "BAD_VIRTUAL_OFFSET",
+                f"{name} must be a decimal unsigned 64-bit integer",
+                None,
+            )
+        value = int(text)
+        if value > UINT64_MAX:
+            raise AuditError(
+                "BAD_VIRTUAL_OFFSET",
+                f"{name} must be at most {UINT64_MAX}",
+                None,
+            )
+        return value
+
+    def _handle_audit(self) -> None:
+        parts = self._read_multipart_parts()
+        if parts is None or not self._require_parts(parts, ("archive", "index")):
             return
 
         try:
             result = audit(parts["archive"], parts["index"])
         except AuditError as exc:
-            # Size is a transport-level rejection; everything else is a
-            # semantic 422 with a stable, locatable error code.
-            status = (
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE
-                if exc.code == "ARCHIVE_TOO_LARGE"
-                else HTTPStatus.UNPROCESSABLE_ENTITY
-            )
-            self._write_json(
-                status,
-                {
-                    "error": {
-                        "code": exc.code,
-                        "message": str(exc),
-                        "offset": exc.offset,
-                    }
-                },
-            )
+            self._write_audit_error(exc)
             return
 
         self._write_json(
@@ -224,6 +276,35 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "sha256": result.sha256,
             },
         )
+
+    def _handle_extract(self) -> None:
+        parts = self._read_multipart_parts()
+        if parts is None:
+            return
+        if not self._require_parts(parts, ("archive", "index", "virtualStart", "virtualEnd")):
+            return
+
+        try:
+            virtual_start = self._parse_uint64_field(parts, "virtualStart")
+            virtual_end = self._parse_uint64_field(parts, "virtualEnd")
+            data, canonical_start, canonical_end = extract(
+                parts["archive"], parts["index"], virtual_start, virtual_end
+            )
+        except AuditError as exc:
+            self._write_audit_error(exc)
+            return
+
+        # Only emit bytes after every check has succeeded, so an invalid,
+        # reversed or over-limit request can never return partial data.
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Virtual-Start", str(canonical_start))
+        self.send_header("X-Virtual-End", str(canonical_end))
+        self.send_header("X-Content-SHA256", hashlib.sha256(data).hexdigest())
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
 
     def _drain_best_effort(self, length: int) -> None:
         """Discard up to ``length`` request bytes without storing them."""
